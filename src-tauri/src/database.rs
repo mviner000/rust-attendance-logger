@@ -9,6 +9,14 @@ use bcrypt::{hash, verify, DEFAULT_COST};
 use serde::{Serialize, Deserialize};
 use thiserror::Error;
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreateUserRequest {
+    pub username: String,
+    pub password: String,
+    pub email: Option<String>,
+    pub full_name: Option<String>,
+}
+
 #[derive(Error, Debug)]
 pub enum AuthError {
     #[error("Database error: {0}")]
@@ -44,6 +52,64 @@ pub struct Database {
 }
 
 impl Database {
+    pub fn create_user(&self, req: CreateUserRequest) -> Result<User, AuthError> {
+        let mut conn = self.pool.get_conn()?;
+        
+        // Check if username exists
+        let exists: Option<i32> = conn
+            .exec_first(
+                "SELECT id FROM users WHERE username = :username",
+                params! {
+                    "username" => &req.username,
+                }
+            )?;
+            
+        if exists.is_some() {
+            return Err(AuthError::UsernameTaken);
+        }
+        
+        // Hash password
+        let password_hash = hash(req.password.as_bytes(), DEFAULT_COST)
+            .map_err(|_| AuthError::HashingError)?;
+            
+        // Insert user with optional fields
+        let query = "INSERT INTO users 
+            (username, password_hash, email, full_name) 
+            VALUES (:username, :password_hash, :email, :full_name)";
+        
+        conn.exec_drop(
+            query,
+            params! {
+                "username" => &req.username,
+                "password_hash" => &password_hash,
+                "email" => &req.email,
+                "full_name" => &req.full_name,
+            }
+        )?;
+        
+        let id = conn.last_insert_id() as i32;
+        
+        Ok(User {
+            id,
+            username: req.username,
+        })
+    }
+
+    pub fn get_all_users(&self) -> Result<Vec<User>, AuthError> {
+        let mut conn = self.pool.get_conn()?;
+        
+        let users: Vec<User> = conn
+            .query("SELECT id, username FROM users ORDER BY created_at DESC")?
+            .into_iter()
+            .map(|row| {
+                let (id, username): (i32, String) = mysql::from_row(row);
+                User { id, username }
+            })
+            .collect();
+        
+        Ok(users)
+    }
+
     pub fn new() -> Result<Self> {
         dotenv().ok();
         
@@ -63,6 +129,8 @@ impl Database {
                 id INT PRIMARY KEY AUTO_INCREMENT,
                 username VARCHAR(255) UNIQUE NOT NULL,
                 password_hash VARCHAR(255) NOT NULL,
+                email VARCHAR(255),
+                full_name VARCHAR(255),
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )"
         )?;

@@ -1,13 +1,15 @@
+<!-- src/App.vue -->
+
 <script setup lang="ts">
-// This starter template is using Vue 3 <script setup> SFCs
-// Check out https://vuejs.org/api/sfc-script-setup.html#script-setup
 import DarkMode from "./components/DarkMode.vue";
 import Greet from "./components/Greet.vue";
+import UserTable from "./components/UserTable.vue";
 </script>
 
 <template>
   <DarkMode class="float-right" />
-  <div class="w-full h-full flex items-center">
-    <Greet />
+  <div class="container mx-auto p-4">
+    <Greet class="mb-4" />
+    <UserTable />
   </div>
 </template>

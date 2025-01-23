@@ -5,10 +5,104 @@ use anyhow::{Result, anyhow};
 use std::path::Path;
 use tauri_plugin_shell::ShellExt;
 use tauri::Manager;
+use tokio::process::Command;
 
 pub struct SystemSetup;
 
 impl SystemSetup {
+    pub async fn check_and_create_mysql_volume(app: &tauri::AppHandle) -> Result<()> {
+        // Check if the volume exists
+        let volume_check = app.shell().command("docker")
+            .args(["volume", "ls", "--filter", "name=mysql_data"])
+            .output()
+            .await?;
+        
+        let volume_exists = String::from_utf8_lossy(&volume_check.stdout)
+            .contains("mysql_data");
+        
+        if !volume_exists {
+            println!("Creating MySQL data volume...");
+            let create_volume = app.shell().command("docker")
+                .args(["volume", "create", "mysql_data"])
+                .output()
+                .await?;
+            
+            if !create_volume.status.success() {
+                return Err(anyhow!("Failed to create MySQL data volume"));
+            }
+            println!("✓ MySQL data volume created successfully");
+        }
+
+        // Recreate MySQL container with volume
+        println!("Stopping existing MySQL container...");
+        let _ = app.shell().command("docker")
+            .args(["stop", "mysql"])
+            .output()
+            .await;
+        
+        let _ = app.shell().command("docker")
+            .args(["rm", "mysql"])
+            .output()
+            .await;
+        
+        println!("Creating MySQL container with persistent volume...");
+        let output = app.shell().command("docker")
+            .args([
+                "run",
+                "-d",
+                "--name", "mysql",
+                "-v", "mysql_data:/var/lib/mysql",
+                "-e", "MYSQL_ROOT_PASSWORD=password",
+                "-e", "MYSQL_DATABASE=app_db",
+                "-p", "3306:3306",
+                "mysql:8.0"
+            ])
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            return Err(anyhow!("Failed to create MySQL container with volume"));
+        }
+        println!("✓ MySQL container with persistent volume created successfully");
+
+        // Wait for MySQL to initialize
+        println!("Waiting for MySQL to initialize...");
+        thread::sleep(Duration::from_secs(20)); // Increased wait time
+        
+        // Verify database creation
+        match Self::verify_database_creation(app).await {
+            Ok(_) => {
+                println!("✓ Database 'app_db' verified successfully");
+                Ok(())
+            },
+            Err(e) => Err(anyhow!("Database verification failed: {}", e))
+        }
+    }
+
+    async fn verify_database_creation(app: &tauri::AppHandle) -> Result<()> {
+        // Use MySQL client to check database existence
+        let output = app.shell().command("docker")
+            .args([
+                "exec", 
+                "mysql", 
+                "mysql", 
+                "-u", "root", 
+                "-ppassword", 
+                "-e", 
+                "SHOW DATABASES LIKE 'app_db'"
+            ])
+            .output()
+            .await?;
+
+        let output_str = String::from_utf8_lossy(&output.stdout);
+        
+        if output_str.contains("app_db") {
+            Ok(())
+        } else {
+            Err(anyhow!("Database 'app_db' not found"))
+        }
+    }
+
     pub async fn check_docker(app: &tauri::AppHandle) -> bool {
         app.shell().command("docker")
             .args(["--version"])
@@ -148,56 +242,39 @@ impl SystemSetup {
     }
 
     pub async fn check_mysql_container(app: &tauri::AppHandle) -> bool {
-        let output = app.shell().command("docker")
-            .args(["ps", "-a", "--filter", "name=mysql", "--format", "{{.Names}}"])
+        let output = Command::new("docker")
+            .args(["ps", "-a", "-f", "name=^mysql$", "--format", "{{.Names}}"])
             .output()
             .await;
             
         match output {
-            Ok(output) => String::from_utf8_lossy(&output.stdout).contains("mysql"),
-            Err(_) => false,
+            Ok(output) => {
+                let container_name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                !container_name.is_empty()
+            },
+            Err(_) => false
         }
     }
 
     pub async fn start_mysql_container(app: &tauri::AppHandle) -> Result<()> {
-        if !Self::check_mysql_container(app).await {
-            println!("Creating new MySQL container...");
-            
-            let output = app.shell().command("docker")
-                .args([
-                    "run",
-                    "-d",
-                    "--name", "mysql",
-                    "-e", "MYSQL_ROOT_PASSWORD=password",
-                    "-e", "MYSQL_DATABASE=app_db",
-                    "-p", "3306:3306",
-                    "mysql:8.0"
-                ])
-                .output()
-                .await?;
+        let output = app.shell().command("docker")
+            .args([
+                "run",
+                "-d",
+                "--name", "mysql",
+                "-p", "0.0.0.0:3306:3306",  // Bind to all network interfaces
+                "-e", "MYSQL_ROOT_PASSWORD=password",
+                "-e", "MYSQL_DATABASE=app_db",
+                "mysql:8.0"
+            ])
+            .output()
+            .await?;
     
-            if !output.status.success() {
-                return Err(anyhow!("Failed to create MySQL container"));
-            }
-            println!("✓ MySQL container created successfully");
-        } else {
-            println!("Starting existing MySQL container...");
-            
-            let output = app.shell().command("docker")
-                .args(["start", "mysql"])
-                .output()
-                .await?;
-    
-            if !output.status.success() {
-                return Err(anyhow!("Failed to start MySQL container"));
-            }
-            println!("✓ Existing MySQL container started successfully");
+        if !output.status.success() {
+            return Err(anyhow!("Failed to create MySQL container"));
         }
     
-        println!("Waiting for MySQL to initialize...");
-        thread::sleep(Duration::from_secs(15));
-        println!("✓ MySQL initialization complete");
-        
+        thread::sleep(Duration::from_secs(20));  // Increased wait time
         Ok(())
     }
     
@@ -231,23 +308,22 @@ impl SystemSetup {
             Self::start_mysql_container(app).await?;
         }
 
+        // Add database volume creation to setup
+        Self::check_and_create_mysql_volume(app).await?;
+
         println!("✓ System setup completed successfully");
         Ok(())
     }
     
     
     async fn is_docker_running(app: &tauri::AppHandle) -> Result<bool> {
-        let output = app.shell().command("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                "Get-Service 'com.docker.service' | Select-Object -ExpandProperty Status"
-            ])
+        // Instead of strictly checking service status, try a docker command
+        let output = app.shell().command("docker")
+            .args(["ps"])
             .output()
             .await?;
-
-        let status = String::from_utf8_lossy(&output.stdout).trim().to_lowercase();
-        Ok(status == "running")
+    
+        Ok(output.status.success())
     }
 
     pub async fn check_windows_version(app: &tauri::AppHandle) -> Result<bool> {
